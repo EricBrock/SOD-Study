@@ -1,0 +1,438 @@
+'''
+Common code for Salient Objection Detection
+Author  : Terminator(FJN)
+Date    : 2021-02-26
+'''
+
+import os
+from collections import OrderedDict
+import torch.nn as nn
+import torch, torch.optim
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+from ptflops import get_model_complexity_info
+from sklearn.metrics import precision_score, recall_score,precision_recall_curve
+from scipy.ndimage.measurements import center_of_mass
+
+
+# --------------------------   0. Perparation for Metrics   --------------------------
+def get_sod_result(img_original, img_label):
+    assert img_original.dtype == img_label.dtype, 'dtype doesnt match'
+    assert img_original.shape[0] == img_label.shape[0], 'shape(height) doesnt match'
+    assert img_original.shape[1] == img_label.shape[1], 'shape(width) doesnt match'
+    if len(img_label.shape) == 3:
+        img_label = img_label[:, :, 0]
+    result = np.zeros_like(img_original)
+    ret, img_label = cv2.threshold(img_label, 127, 255, cv2.THRESH_BINARY)
+    for height in range(img_original.shape[0]):
+        for width in range(img_original.shape[1]):
+            result[height, width] = img_original[height, width] * (img_label[height, width] / 255)
+
+    return result
+
+def img_binarization(img):
+    ret, img_new = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
+    img_new = (img_new / 255).astype(np.uint8)
+    return img_new
+
+def model_summary(model, input_size, batch_size=-1, device="cuda", show_detail=False):
+    '''
+    :param model:
+    :param input_size:
+    :param batch_size:
+    :param device:
+    :param show_detail:
+    :return: [
+        total params of model
+        input size (related with batchsize)                     MB
+        output size (related with batchsize and input size)     MB
+        params size of model                                    MB
+     ]
+    '''
+
+    def register_hook(module):
+        def hook(module, input, output):
+            class_name = str(module.__class__).split(".")[-1].split("'")[0]
+            module_idx = len(summary)
+            m_key = "%s-%i" % (class_name, module_idx + 1)
+            summary[m_key] = OrderedDict()
+            summary[m_key]["input_shape"] = list(input[0].size())
+            summary[m_key]["input_shape"][0] = batch_size
+            if isinstance(output, (list, tuple)):
+                summary[m_key]["output_shape"] = [[-1] + list(o.size())[1:] for o in output]
+            else:
+                summary[m_key]["output_shape"] = list(output.size())
+                summary[m_key]["output_shape"][0] = batch_size
+            params = 0
+            if hasattr(module, "weight") and hasattr(module.weight, "size"):
+                params += torch.prod(torch.LongTensor(list(module.weight.size())))
+                summary[m_key]["trainable"] = module.weight.requires_grad
+            if hasattr(module, "bias") and hasattr(module.bias, "size"):
+                params += torch.prod(torch.LongTensor(list(module.bias.size())))
+            summary[m_key]["nb_params"] = params
+
+        if (
+                not isinstance(module, nn.Sequential)
+                and not isinstance(module, nn.ModuleList)
+                and not (module == model)
+        ):
+            hooks.append(module.register_forward_hook(hook))
+
+    device = device.lower()
+    assert device in [
+        "cuda",
+        "cpu",
+    ], "Input device is not valid, please specify 'cuda' or 'cpu'"
+    if device == "cuda" and torch.cuda.is_available():
+        dtype = torch.cuda.FloatTensor
+    else:
+        dtype = torch.FloatTensor
+
+    if isinstance(input_size, tuple):
+        input_size = [input_size]
+    x = [torch.rand(2, *in_size).type(dtype) for in_size in input_size]
+    summary = OrderedDict()
+    hooks = []
+    model.apply(register_hook)
+    model(*x)
+    for h in hooks:
+        h.remove()
+    if show_detail:
+        print("----------------------------------------------------------------")
+        print("{:>20}  {:>25} {:>15}".format("Layer (type)", "Output Shape", "Param #"))
+        print("================================================================")
+    total_params = 0
+    total_output = 0
+    trainable_params = 0
+    for layer in summary:
+        # input_shape, output_shape, trainable, nb_params
+        line_new = "{:>20}  {:>25} {:>15}".format(
+            layer,
+            str(summary[layer]["output_shape"]),
+            "{0:,}".format(summary[layer]["nb_params"]), )
+        total_params += summary[layer]["nb_params"]
+        total_output += np.prod(summary[layer]["output_shape"])
+        if "trainable" in summary[layer]:
+            if summary[layer]["trainable"] == True:
+                trainable_params += summary[layer]["nb_params"]
+        if show_detail:
+            print(line_new)
+    total_input_size = abs(np.prod(input_size) * batch_size * 4. / (1024 ** 2.))
+    total_output_size = abs(2. * total_output * 4. / (1024 ** 2.))  # x2 for gradients
+    total_params_size = abs(total_params.numpy() * 4. / (1024 ** 2.))
+    total_size = total_params_size + total_output_size + total_input_size
+    params_list = [total_params.numpy().tolist(), total_input_size, total_output_size, total_params_size]
+    if show_detail:
+        print("================================================================")
+        print("Total params: {0:,}".format(total_params))
+        print("Trainable params: {0:,}".format(trainable_params))
+        print("Non-trainable params: {0:,}".format(total_params - trainable_params))
+        print("----------------------------------------------------------------")
+        print("Input size (MB): %0.2f" % total_input_size)
+        print("Forward/backward pass size (MB): %0.2f" % total_output_size)
+        print("Params size (MB): %0.2f" % total_params_size)
+        print("Estimated Total Size (MB): %0.2f" % total_size)
+        print("----------------------------------------------------------------")
+    return params_list
+
+# --------------------------   1. Evaluation Metrics   --------------------------
+
+# 1.1   Model   -   flops, params, size
+def get_flops_params_size(model, input_size=(3, 224, 224), as_strings=True, print_per_layer_stat=False):
+    flops, params = get_model_complexity_info(model, input_size, as_strings=as_strings,
+                                              print_per_layer_stat=print_per_layer_stat)
+    result = model_summary(model.to(torch.device('cuda:0')), input_size=input_size, batch_size=1,
+                           show_detail=print_per_layer_stat)
+    return flops, params, str(result[-1]) + ' M'
+
+# 1.2   SOD     -   precision, recall, mIOU, mae, Fmeasure, Smeasure, PR cure
+class SOD_Index(object):
+
+    def __init__(self, y_pred, y_true, n=2, binarization=False):
+        assert y_pred.dtype == y_true.dtype, 'dtype doesnt match'
+        assert y_pred.shape == y_true.shape, 'shape(height) doesnt match'
+
+        self.n = n
+
+        # binarization img
+        if binarization:
+            self.y_true = img_binarization(y_true)
+            self.y_pred = img_binarization(y_pred)
+        else:
+            self.y_true = y_true
+            self.y_pred = y_pred
+
+        # change 2D shape to 1D shape
+        self.y_true_re = np.reshape(self.y_true, [-1])
+        self.y_pred_re = np.reshape(self.y_pred, [-1])
+
+        self.precision = precision_score(self.y_true_re, self.y_pred_re, average='micro')
+        self.recall = recall_score(self.y_true_re, self.y_pred_re, average='micro')
+
+    def fast_hist(self):
+        k = (self.y_pred_re >= 0) & (self.y_pred_re < self.n)
+        # 这句会返回混淆矩阵
+        return np.bincount(self.n * self.y_pred_re[k].astype(int) + self.y_true_re[k], minlength=self.n ** 2).reshape(
+            self.n, self.n)
+
+    def per_class_iou(self):
+        # hist传入混淆矩阵(n, n)
+        hist = self.fast_hist()
+        np.seterr(divide="ignore", invalid="ignore")
+
+        # 交集：np.diag取hist的对角线元素
+        # 并集：hist.sum(1)和hist.sum(0)分别按两个维度相加，而对角线元素加了两次，因此减一次
+        res = np.diag(hist) / (hist.sum(1) + hist.sum(0) - np.diag(hist))
+
+        # 把报错设回来
+        np.seterr(divide="warn", invalid="warn")
+
+        # 如果分母为0，结果是nan，会影响后续处理，因此把nan都置为0
+        res[np.isnan(res)] = 0.
+        return res
+
+    # 1 precision
+    def cal_precision(self):
+        return self.precision
+
+    # 2 recall
+    def cal_recall(self):
+        return self.recall
+
+    # 3 mIOU
+    def cal_miou(self, ignore=None):
+        self.ious = dict()
+        self.ious = dict(zip(range(self.n), self.per_class_iou()))  # {0: iou, 1: iou, ...}
+        total_iou = 0
+        count = 0
+        for key, value in self.ious.items():
+            if isinstance(ignore, list) and key in ignore or isinstance(ignore, int) and key == ignore:
+                continue
+            total_iou += value
+            count += 1
+        return total_iou / count
+
+    # 4 mae
+    def cal_mae(self):
+        return np.mean(np.abs(self.y_pred_re - self.y_true_re))
+
+    # 5 Fmeasure
+    def cal_fmeasure(self, beta=0.3):
+        return (1 + beta) * self.precision * self.recall / (beta * self.precision + self.recall)
+
+    # 6 Smeasure
+    def cal_smeasure(self):
+        """
+           - Given a saliency map (smap) and ground truth (gt)
+           - Return Structure measure
+             * Structure measure: A new way to evaluate foreground maps
+               [Deng-Ping Fan et. al - ICCV 2017]
+             //see https://github.com/DengPingFan/S-measure
+        """
+        smap, gt = self.y_pred, self.y_true
+        mu = np.mean(gt)  # ratio of foreground area in gt
+
+        def pixel_sim_score(a, b):
+            # see how many b==1 (gt) pixels are correct in a
+            x = a[b == 1]
+            mu_x, sig_x = np.mean(x), np.std(x)
+            # score based on the mean and std of accuracy
+            return 2.0 * mu_x / (mu_x ** 2 + 1.0 + sig_x + 1e-8)
+
+        def S_object():
+            # foreground similarity
+            smap_fg = np.logical_and(smap, gt)
+            O_FG = pixel_sim_score(smap_fg, gt)
+            # background similarity
+            smap_bg = np.logical_and(1 - smap, 1 - gt)
+            O_BG = pixel_sim_score(smap_bg, 1 - gt)
+            # return combined score
+            return mu * O_FG + (1 - mu) * O_BG
+
+        def S_region():
+            # find the centroid of the gt
+            xc, yc = map(int, center_of_mass(gt))
+            # divide gt into 4 regions
+            gt1, w1, gt2, w2, gt3, w3, gt4, w4 = get_quad_mask(xc, yc, gt)
+            # divide smap into 4 regions
+            smap1, _, smap2, _, smap3, _, smap4, _ = get_quad_mask(xc, yc, smap)
+            # compute the ssim score for each regions
+            Sr1 = get_SSIM_bin(smap1, gt1)
+            Sr2 = get_SSIM_bin(smap2, gt2)
+            Sr3 = get_SSIM_bin(smap3, gt3)
+            Sr4 = get_SSIM_bin(smap4, gt4)
+            # return weighted sum
+            return w1 * Sr1 + w2 * Sr2 + w3 * Sr3 + w4 * Sr4
+
+        def get_quad_mask(xc, yc, mask):
+            # divide mask into 4 regions a given centroid (x, y)
+            imH, imW = mask.shape
+            area = imW * imH
+            # 4 regions R1-R4: weights are proportional to their area
+            R1 = mask[0:yc, 0:xc]
+            w1 = (1.0 * xc * yc) / area
+            R2 = mask[0:yc, xc:imW]
+            w2 = (1.0 * (imW - xc) * yc) / area
+            R3 = mask[yc:imH, 0:xc]
+            w3 = (1.0 * xc * (imH - yc)) / area
+            R4 = mask[yc:imH, xc:imW]
+            w4 = (1.0 - w1 - w2 - w3)
+            return R1, w1, R2, w2, R3, w3, R4, w4
+
+        def get_SSIM_bin(X, Y):
+            N = np.size(Y)
+            X = X.astype(np.float32)
+            mu_x = np.mean(X)
+            Y = Y.astype(np.float32)
+            mu_y = np.mean(Y)
+            # Compute the variance of SM,GT
+            sigma_x = np.sum((X - mu_x) ** 2) / (N - 1 + 1e-8)
+            sigma_y = np.sum((Y - mu_y) ** 2) / (N - 1 + 1e-8)
+            # Compute the covariance between SM and GT
+            sigma_xy = np.sum((X - mu_x) * (Y - mu_y)) / (N - 1 + 1e-8)
+            alpha = 4 * mu_x * mu_x * sigma_xy
+            beta = (mu_x ** 2 + mu_y ** 2) * (sigma_x + sigma_y)
+            ssim = alpha / (beta + 1e-8)
+            if alpha != 0:
+                return ssim
+            else:
+                return 1 if (alpha == 0 and beta == 0) else 0
+
+        #######################################################
+        if mu == 0 or mu == 1:  # if gt is completely black or white
+            mu_s = np.mean(smap)  # only get the intersection
+            S = 1 - mu_s if mu == 0 else mu_s
+        else:
+            alpha = 0.5
+            S = alpha * S_object() + (1 - alpha) * S_region()
+        return S if S > 0 else 0
+
+    # 7 PR cure
+    def cal_prc(self, saved=False, save_path='/'):
+        precision, recall, thresholds = precision_recall_curve(self.y_true_re, self.y_pred_re, pos_label=None,
+                                                               sample_weight=None)
+        plt.figure(1)  # 创建图表1
+        plt.title('Precision Recall Curve')  # give plot a title
+        plt.xlabel('Recall')  # make axis labels
+        plt.ylabel('Precision')
+        plt.figure(1)
+        plt.plot(precision, recall)
+        if saved:
+            plt.savefig(save_path+'prc.png')
+        plt.show()
+
+    # cal several indexes and return a list
+    def cal_all(self):
+        return [self.cal_miou(), self.cal_mae(), self.cal_fmeasure(), self.cal_smeasure()]
+
+# --------------------------   2. Common Functions   --------------------------
+
+class AverageCounter(object):
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.sum += val
+        self.count += n
+        self.avg = self.sum / self.count
+
+class AccuracyCounter(object):
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.accu = 0
+        self.sum = 0
+        self.correct = 0
+
+    def update(self, val):
+        if val:
+            self.correct += 1
+        self.sum += 1
+        self.accu = self.correct / self.sum
+
+def make_folder(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+class Model_Statistics():
+
+    def __init__(self, statistics_path, param_list):
+        assert len(param_list) > 1, 'MyAssert: param_list must contain two more values'
+
+        self.txt_path = statistics_path + '/txt/'
+        self.graph_path = statistics_path + '/graph/'
+
+        make_folder(self.txt_path)
+        make_folder(self.graph_path)
+
+        self.list_count = {}
+        self.average_count = {}
+        self.param_list = param_list
+
+        for item in param_list:
+            self.list_count[item] = []
+            self.average_count[item] = AverageCounter()
+
+        self.read_from_txt()
+        self.reset_all_counter()
+
+    # append new value to average_count
+    def update_counter(self, name, value):
+        assert self.average_count.__contains__(name), 'MyAssert: not found ' + name + ' in average_count'
+        self.average_count[name].update(value)
+        pass
+
+    # append new value to list_count
+    def update_list(self):
+        for name in self.param_list:
+            assert self.list_count.__contains__(name), 'MyAssert: not found ' + name + ' in list_count'
+            self.list_count[name].append(self.average_count[name].avg)
+        pass
+
+    # reset all Averagecounter
+    def reset_all_counter(self):
+        for averagecounter in self.average_count:
+            self.average_count[averagecounter].reset()
+        pass
+
+    # draw one item in count_list
+    def draw(self, name_list, saved=False, color_start=0):
+        import matplotlib.colors as mcolors
+        colors = list(mcolors.TABLEAU_COLORS.keys())  # 颜色变化
+        title_name = ''
+        for i, name in enumerate(name_list):
+            plt.plot(list(range(len(self.list_count[name]))), self.list_count[name], linestyle="-", marker="",
+                     linewidth=2, color=mcolors.TABLEAU_COLORS[colors[i + color_start]], label=name)
+            title_name += (name + ' ')
+        plt.legend(loc='upper right')
+        plt.title(title_name)
+        plt.xlabel('epoch')
+        plt.ylabel('value')
+        if saved:
+            plt.savefig(self.graph_path + title_name + '.png')
+        plt.show()
+        pass
+
+    # write all records to the txt
+    def write_all_to_txt(self):
+        for name in self.param_list:
+            file = open(os.path.join(self.txt_path, name + '.txt'), 'w')
+            for item in self.list_count[name]:
+                file.write(str(item) + '\n')
+            # print('write ' + name +' to ' + os.path.join(self.self.statistics_path, name+'.txt') + ' successfully!')
+        pass
+
+    # read records from statistics_path
+    def read_from_txt(self):
+        for name in self.param_list:
+            if (os.path.exists(os.path.join(self.txt_path, name + '.txt'))):
+                for line in open(os.path.join(self.txt_path, name + '.txt'), "r"):  # 设置文件对象并读取每一行文件
+                    self.list_count[name].append(float(line[:-1]))
+
