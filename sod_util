@@ -1,19 +1,16 @@
 '''
 Common code for Salient Objection Detection
 Author  : Terminator(FJN)
-Date    : 2021-02-26
+Date    : 2021-03-08
 '''
 
-import os
-from collections import OrderedDict
-import torch.nn as nn
-import torch, torch.optim
 import numpy as np
 import matplotlib.pyplot as plt
 import cv2
 from ptflops import get_model_complexity_info
-from sklearn.metrics import precision_score, recall_score,precision_recall_curve
+from sklearn.metrics import precision_score, recall_score, precision_recall_curve, roc_curve, auc
 from scipy.ndimage.measurements import center_of_mass
+from torchsummary import summary
 
 
 # --------------------------   0. Perparation for Metrics   --------------------------
@@ -36,117 +33,18 @@ def img_binarization(img):
     img_new = (img_new / 255).astype(np.uint8)
     return img_new
 
-def model_summary(model, input_size, batch_size=-1, device="cuda", show_detail=False):
-    '''
-    :param model:
-    :param input_size:
-    :param batch_size:
-    :param device:
-    :param show_detail:
-    :return: [
-        total params of model
-        input size (related with batchsize)                     MB
-        output size (related with batchsize and input size)     MB
-        params size of model                                    MB
-     ]
-    '''
-
-    def register_hook(module):
-        def hook(module, input, output):
-            class_name = str(module.__class__).split(".")[-1].split("'")[0]
-            module_idx = len(summary)
-            m_key = "%s-%i" % (class_name, module_idx + 1)
-            summary[m_key] = OrderedDict()
-            summary[m_key]["input_shape"] = list(input[0].size())
-            summary[m_key]["input_shape"][0] = batch_size
-            if isinstance(output, (list, tuple)):
-                summary[m_key]["output_shape"] = [[-1] + list(o.size())[1:] for o in output]
-            else:
-                summary[m_key]["output_shape"] = list(output.size())
-                summary[m_key]["output_shape"][0] = batch_size
-            params = 0
-            if hasattr(module, "weight") and hasattr(module.weight, "size"):
-                params += torch.prod(torch.LongTensor(list(module.weight.size())))
-                summary[m_key]["trainable"] = module.weight.requires_grad
-            if hasattr(module, "bias") and hasattr(module.bias, "size"):
-                params += torch.prod(torch.LongTensor(list(module.bias.size())))
-            summary[m_key]["nb_params"] = params
-
-        if (
-                not isinstance(module, nn.Sequential)
-                and not isinstance(module, nn.ModuleList)
-                and not (module == model)
-        ):
-            hooks.append(module.register_forward_hook(hook))
-
-    device = device.lower()
-    assert device in [
-        "cuda",
-        "cpu",
-    ], "Input device is not valid, please specify 'cuda' or 'cpu'"
-    if device == "cuda" and torch.cuda.is_available():
-        dtype = torch.cuda.FloatTensor
-    else:
-        dtype = torch.FloatTensor
-
-    if isinstance(input_size, tuple):
-        input_size = [input_size]
-    x = [torch.rand(2, *in_size).type(dtype) for in_size in input_size]
-    summary = OrderedDict()
-    hooks = []
-    model.apply(register_hook)
-    model(*x)
-    for h in hooks:
-        h.remove()
-    if show_detail:
-        print("----------------------------------------------------------------")
-        print("{:>20}  {:>25} {:>15}".format("Layer (type)", "Output Shape", "Param #"))
-        print("================================================================")
-    total_params = 0
-    total_output = 0
-    trainable_params = 0
-    for layer in summary:
-        # input_shape, output_shape, trainable, nb_params
-        line_new = "{:>20}  {:>25} {:>15}".format(
-            layer,
-            str(summary[layer]["output_shape"]),
-            "{0:,}".format(summary[layer]["nb_params"]), )
-        total_params += summary[layer]["nb_params"]
-        total_output += np.prod(summary[layer]["output_shape"])
-        if "trainable" in summary[layer]:
-            if summary[layer]["trainable"] == True:
-                trainable_params += summary[layer]["nb_params"]
-        if show_detail:
-            print(line_new)
-    total_input_size = abs(np.prod(input_size) * batch_size * 4. / (1024 ** 2.))
-    total_output_size = abs(2. * total_output * 4. / (1024 ** 2.))  # x2 for gradients
-    total_params_size = abs(total_params.numpy() * 4. / (1024 ** 2.))
-    total_size = total_params_size + total_output_size + total_input_size
-    params_list = [total_params.numpy().tolist(), total_input_size, total_output_size, total_params_size]
-    if show_detail:
-        print("================================================================")
-        print("Total params: {0:,}".format(total_params))
-        print("Trainable params: {0:,}".format(trainable_params))
-        print("Non-trainable params: {0:,}".format(total_params - trainable_params))
-        print("----------------------------------------------------------------")
-        print("Input size (MB): %0.2f" % total_input_size)
-        print("Forward/backward pass size (MB): %0.2f" % total_output_size)
-        print("Params size (MB): %0.2f" % total_params_size)
-        print("Estimated Total Size (MB): %0.2f" % total_size)
-        print("----------------------------------------------------------------")
-    return params_list
-
 # --------------------------   1. Evaluation Metrics   --------------------------
 
 # 1.1   Model   -   flops, params, size
-def get_flops_params_size(model, input_size=(3, 224, 224), as_strings=True, print_per_layer_stat=False):
-    flops, params = get_model_complexity_info(model, input_size, as_strings=as_strings,
-                                              print_per_layer_stat=print_per_layer_stat)
-    result = model_summary(model.to(torch.device('cuda:0')), input_size=input_size, batch_size=1,
-                           show_detail=print_per_layer_stat)
-    return flops, params, str(result[-1]) + ' M'
+def get_flops_params(model, input_size=(3, 224, 224), as_strings=True, print_per_layer_stat=False):
+    flops, params = get_model_complexity_info(model, input_size, as_strings=as_strings, print_per_layer_stat=print_per_layer_stat)
+    return flops, params
 
-# 1.2   SOD     -   precision, recall, mIOU, mae, Fmeasure, Smeasure, PR cure
+# 1.2   Model   -   size
+def get_model_summary(model,input_size=(3, 224, 224)):
+    summary(model, input_size)
+
+# 1.3   SOD     -   precision, recall, mIOU, mae, Fmeasure, Smeasure, PR cure
 class SOD_Index(object):
 
     def __init__(self, y_pred, y_true, n=2, binarization=False):
@@ -167,27 +65,23 @@ class SOD_Index(object):
         self.y_true_re = np.reshape(self.y_true, [-1])
         self.y_pred_re = np.reshape(self.y_pred, [-1])
 
-        self.precision = precision_score(self.y_true_re, self.y_pred_re, average='micro')
-        self.recall = recall_score(self.y_true_re, self.y_pred_re, average='micro')
+        self.precision = precision_score(self.y_true, self.y_pred, average='micro')
+        self.recall = recall_score(self.y_true, self.y_pred, average='micro')
 
     def fast_hist(self):
+        # 返回混淆矩阵
         k = (self.y_pred_re >= 0) & (self.y_pred_re < self.n)
-        # 这句会返回混淆矩阵
-        return np.bincount(self.n * self.y_pred_re[k].astype(int) + self.y_true_re[k], minlength=self.n ** 2).reshape(
-            self.n, self.n)
+        return np.bincount(self.n * self.y_pred_re[k].astype(int) + self.y_true_re[k], minlength=self.n ** 2).reshape( self.n, self.n)
 
     def per_class_iou(self):
         # hist传入混淆矩阵(n, n)
         hist = self.fast_hist()
         np.seterr(divide="ignore", invalid="ignore")
-
         # 交集：np.diag取hist的对角线元素
         # 并集：hist.sum(1)和hist.sum(0)分别按两个维度相加，而对角线元素加了两次，因此减一次
         res = np.diag(hist) / (hist.sum(1) + hist.sum(0) - np.diag(hist))
-
         # 把报错设回来
         np.seterr(divide="warn", invalid="warn")
-
         # 如果分母为0，结果是nan，会影响后续处理，因此把nan都置为0
         res[np.isnan(res)] = 0.
         return res
@@ -321,7 +215,6 @@ class SOD_Index(object):
         if saved:
             plt.savefig(save_path+'prc.png')
         plt.show()
-
     # cal several indexes and return a list
     def cal_all(self):
         return [self.cal_miou(), self.cal_mae(), self.cal_fmeasure(), self.cal_smeasure()]
